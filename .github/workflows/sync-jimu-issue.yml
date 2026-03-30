@@ -1,0 +1,261 @@
+name: Sync Jimu Issue
+
+on:
+  workflow_call:
+    inputs:
+      issue_labels_json:
+        required: true
+        type: string
+      issue_node_id:
+        required: true
+        type: string
+      issue_state:
+        required: true
+        type: string
+      issue_url:
+        required: true
+        type: string
+      repo_name:
+        required: true
+        type: string
+    secrets:
+      PROJECT_SYNC_TOKEN:
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    steps:
+      - name: Sync issue to project
+        uses: actions/github-script@v7
+        env:
+          ISSUE_LABELS_JSON: ${{ inputs.issue_labels_json }}
+          ISSUE_NODE_ID: ${{ inputs.issue_node_id }}
+          ISSUE_STATE: ${{ inputs.issue_state }}
+          ISSUE_URL: ${{ inputs.issue_url }}
+          ORG_LOGIN: saitama-cond-mat
+          PROJECT_NUMBER: "1"
+          REPO_NAME: ${{ inputs.repo_name }}
+        with:
+          github-token: ${{ secrets.PROJECT_SYNC_TOKEN }}
+          script: |
+            const orgLogin = process.env.ORG_LOGIN;
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+            const issueNodeId = process.env.ISSUE_NODE_ID;
+            const issueState = process.env.ISSUE_STATE;
+            const issueUrl = process.env.ISSUE_URL;
+            const repoName = process.env.REPO_NAME;
+            const labels = JSON.parse(process.env.ISSUE_LABELS_JSON || "[]");
+
+            function issueStatusFromLabels(state, labelList) {
+              if (String(state).toLowerCase() === "closed") {
+                return "対応完了";
+              }
+
+              const names = new Set(labelList.map((label) => label.name));
+              if (names.has("jimu:waiting")) {
+                return "待ち";
+              }
+              if (names.has("jimu:doing")) {
+                return "対応中";
+              }
+              if (names.has("jimu:done")) {
+                return "対応完了";
+              }
+              return "やること";
+            }
+
+            async function loadProject() {
+              const query = `
+                query($login: String!, $number: Int!, $after: String) {
+                  organization(login: $login) {
+                    projectV2(number: $number) {
+                      id
+                      title
+                      fields(first: 50) {
+                        nodes {
+                          __typename
+                          ... on ProjectV2Field {
+                            id
+                            name
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options {
+                              id
+                              name
+                            }
+                          }
+                        }
+                      }
+                      items(first: 100, after: $after) {
+                        nodes {
+                          id
+                          content {
+                            __typename
+                            ... on Issue {
+                              id
+                              url
+                            }
+                          }
+                        }
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+
+              const fields = [];
+              const items = [];
+              let projectId = null;
+              let title = null;
+              let after = null;
+
+              while (true) {
+                const response = await github.graphql(query, {
+                  after,
+                  login: orgLogin,
+                  number: projectNumber,
+                });
+                const project = response.organization.projectV2;
+                projectId = project.id;
+                title = project.title;
+                if (fields.length === 0) {
+                  fields.push(...project.fields.nodes);
+                }
+                items.push(...project.items.nodes);
+                if (!project.items.pageInfo.hasNextPage) {
+                  break;
+                }
+                after = project.items.pageInfo.endCursor;
+              }
+
+              return { fields, items, projectId, title };
+            }
+
+            const desiredStatus = issueStatusFromLabels(issueState, labels);
+            const member = repoName.startsWith("jimu-") ? repoName.slice(5) : repoName;
+
+            const project = await loadProject();
+            const fieldByName = new Map(project.fields.map((field) => [field.name, field]));
+
+            const statusField = fieldByName.get("Status");
+            const taskTypeField = fieldByName.get("Task Type");
+            const issueUrlField = fieldByName.get("Issue URL");
+            const memberField = fieldByName.get("Member");
+
+            if (!statusField || !taskTypeField || !issueUrlField || !memberField) {
+              core.setFailed("Required project fields are missing.");
+              return;
+            }
+
+            const statusOption = statusField.options.find((option) => option.name === desiredStatus);
+            const linkedOption = taskTypeField.options.find((option) => option.name === "linked");
+
+            if (!statusOption || !linkedOption) {
+              core.setFailed("Required project options are missing.");
+              return;
+            }
+
+            let item = project.items.find((candidate) => {
+              if (!candidate.content || candidate.content.__typename !== "Issue") {
+                return false;
+              }
+              return candidate.content.id === issueNodeId || candidate.content.url === issueUrl;
+            });
+
+            if (!item) {
+              const addResult = await github.graphql(
+                `
+                  mutation($projectId: ID!, $contentId: ID!) {
+                    addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                      item {
+                        id
+                      }
+                    }
+                  }
+                `,
+                {
+                  contentId: issueNodeId,
+                  projectId: project.projectId,
+                },
+              );
+              item = { id: addResult.addProjectV2ItemById.item.id };
+            }
+
+            async function updateTextField(fieldId, text) {
+              await github.graphql(
+                `
+                  mutation($fieldId: ID!, $itemId: ID!, $projectId: ID!, $text: String!) {
+                    updateProjectV2ItemFieldValue(
+                      input: {
+                        fieldId: $fieldId
+                        itemId: $itemId
+                        projectId: $projectId
+                        value: { text: $text }
+                      }
+                    ) {
+                      projectV2Item {
+                        id
+                      }
+                    }
+                  }
+                `,
+                {
+                  fieldId,
+                  itemId: item.id,
+                  projectId: project.projectId,
+                  text,
+                },
+              );
+            }
+
+            async function updateSingleSelectField(fieldId, optionId) {
+              await github.graphql(
+                `
+                  mutation($fieldId: ID!, $itemId: ID!, $optionId: String!, $projectId: ID!) {
+                    updateProjectV2ItemFieldValue(
+                      input: {
+                        fieldId: $fieldId
+                        itemId: $itemId
+                        projectId: $projectId
+                        value: { singleSelectOptionId: $optionId }
+                      }
+                    ) {
+                      projectV2Item {
+                        id
+                      }
+                    }
+                  }
+                `,
+                {
+                  fieldId,
+                  itemId: item.id,
+                  optionId,
+                  projectId: project.projectId,
+                },
+              );
+            }
+
+            await updateSingleSelectField(statusField.id, statusOption.id);
+            await updateSingleSelectField(taskTypeField.id, linkedOption.id);
+            await updateTextField(issueUrlField.id, issueUrl);
+            await updateTextField(memberField.id, member);
+
+            core.summary
+              .addHeading("Jimu issue synced")
+              .addTable([
+                [{ data: "Project", header: true }, project.title],
+                [{ data: "Issue URL", header: true }, issueUrl],
+                [{ data: "Status", header: true }, desiredStatus],
+                [{ data: "Task Type", header: true }, "linked"],
+                [{ data: "Member", header: true }, member],
+              ])
+              .write();
