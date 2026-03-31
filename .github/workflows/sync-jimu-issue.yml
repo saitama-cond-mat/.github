@@ -3,6 +3,9 @@ name: Sync Jimu Issue
 on:
   workflow_call:
     inputs:
+      issue_action:
+        required: true
+        type: string
       issue_labels_json:
         required: true
         type: string
@@ -29,9 +32,10 @@ jobs:
       contents: read
     steps:
       - name: Sync issue to project
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           ISSUE_LABELS_JSON: ${{ inputs.issue_labels_json }}
+          ISSUE_ACTION: ${{ inputs.issue_action }}
           ISSUE_NODE_ID: ${{ inputs.issue_node_id }}
           ISSUE_STATE: ${{ inputs.issue_state }}
           ISSUE_URL: ${{ inputs.issue_url }}
@@ -43,11 +47,24 @@ jobs:
           script: |
             const orgLogin = process.env.ORG_LOGIN;
             const projectNumber = Number(process.env.PROJECT_NUMBER);
+            const issueAction = process.env.ISSUE_ACTION;
             const issueNodeId = process.env.ISSUE_NODE_ID;
             const issueState = process.env.ISSUE_STATE;
             const issueUrl = process.env.ISSUE_URL;
             const repoName = process.env.REPO_NAME;
-            const labels = JSON.parse(process.env.ISSUE_LABELS_JSON || "[]");
+            let labels = JSON.parse(process.env.ISSUE_LABELS_JSON || "[]");
+
+            function extractIssueCoordinates(targetUrl) {
+              const match = targetUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/([0-9]+)$/);
+              if (!match) {
+                return null;
+              }
+              return {
+                owner: match[1],
+                repo: match[2],
+                issue_number: Number(match[3]),
+              };
+            }
 
             function issueStatusFromLabels(state, labelList) {
               if (String(state).toLowerCase() === "closed") {
@@ -65,6 +82,32 @@ jobs:
                 return "対応完了";
               }
               return "やること";
+            }
+
+            async function ensureDefaultJimuLabel() {
+              const hasJimuLabel = labels.some((label) => String(label.name).startsWith("jimu:"));
+              if (issueAction !== "opened" || hasJimuLabel) {
+                return;
+              }
+
+              const coords = extractIssueCoordinates(issueUrl);
+              if (!coords) {
+                core.warning(`Could not parse issue URL: ${issueUrl}`);
+                return;
+              }
+
+              const currentIssue = await github.request("GET /repos/{owner}/{repo}/issues/{issue_number}", coords);
+              const currentLabels = currentIssue.data.labels
+                .map((label) => typeof label === "string" ? label : label.name)
+                .filter(Boolean);
+              const nextLabels = Array.from(new Set([...currentLabels, "jimu:todo"]));
+
+              await github.request("PATCH /repos/{owner}/{repo}/issues/{issue_number}", {
+                ...coords,
+                labels: nextLabels,
+              });
+
+              labels = nextLabels.map((name) => ({ name }));
             }
 
             async function loadProject() {
@@ -140,6 +183,7 @@ jobs:
               return { fields, items, projectId, title };
             }
 
+            await ensureDefaultJimuLabel();
             const desiredStatus = issueStatusFromLabels(issueState, labels);
             const member = repoName.startsWith("jimu-") ? repoName.slice(5) : repoName;
 
