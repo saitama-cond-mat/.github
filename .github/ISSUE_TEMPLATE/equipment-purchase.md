@@ -2,7 +2,7 @@
 name: 備品購入申請
 about: 備品や消耗品の購入に関する事務処理を依頼します
 title: "[備品購入] "
-labels: ["jimu:todo"]
+labels: []
 assignees: []
 ---
 

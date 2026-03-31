@@ -2,7 +2,7 @@
 name: 旅費申請
 about: 旅費精算や出張関連の事務処理を依頼します
 title: "[旅費] "
-labels: ["jimu:todo"]
+labels: []
 assignees: []
 ---
 

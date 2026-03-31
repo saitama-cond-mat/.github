@@ -6,9 +6,6 @@ on:
       issue_action:
         required: true
         type: string
-      issue_labels_json:
-        required: true
-        type: string
       issue_node_id:
         required: true
         type: string
@@ -34,7 +31,6 @@ jobs:
       - name: Sync issue to project
         uses: actions/github-script@v8
         env:
-          ISSUE_LABELS_JSON: ${{ inputs.issue_labels_json }}
           ISSUE_ACTION: ${{ inputs.issue_action }}
           ISSUE_NODE_ID: ${{ inputs.issue_node_id }}
           ISSUE_STATE: ${{ inputs.issue_state }}
@@ -52,62 +48,15 @@ jobs:
             const issueState = process.env.ISSUE_STATE;
             const issueUrl = process.env.ISSUE_URL;
             const repoName = process.env.REPO_NAME;
-            let labels = JSON.parse(process.env.ISSUE_LABELS_JSON || "[]");
 
-            function extractIssueCoordinates(targetUrl) {
-              const match = targetUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/([0-9]+)$/);
-              if (!match) {
-                return null;
-              }
-              return {
-                owner: match[1],
-                repo: match[2],
-                issue_number: Number(match[3]),
-              };
-            }
-
-            function issueStatusFromLabels(state, labelList) {
-              if (String(state).toLowerCase() === "closed") {
+            function issueStatusFromEvent(action, state) {
+              if (String(state).toLowerCase() === "closed" || action === "closed") {
                 return "対応完了";
               }
-
-              const names = new Set(labelList.map((label) => label.name));
-              if (names.has("jimu:waiting")) {
-                return "待ち";
+              if (action === "opened" || action === "reopened") {
+                return "やること";
               }
-              if (names.has("jimu:doing")) {
-                return "対応中";
-              }
-              if (names.has("jimu:done")) {
-                return "対応完了";
-              }
-              return "やること";
-            }
-
-            async function ensureDefaultJimuLabel() {
-              const hasJimuLabel = labels.some((label) => String(label.name).startsWith("jimu:"));
-              if (issueAction !== "opened" || hasJimuLabel) {
-                return;
-              }
-
-              const coords = extractIssueCoordinates(issueUrl);
-              if (!coords) {
-                core.warning(`Could not parse issue URL: ${issueUrl}`);
-                return;
-              }
-
-              const currentIssue = await github.request("GET /repos/{owner}/{repo}/issues/{issue_number}", coords);
-              const currentLabels = currentIssue.data.labels
-                .map((label) => typeof label === "string" ? label : label.name)
-                .filter(Boolean);
-              const nextLabels = Array.from(new Set([...currentLabels, "jimu:todo"]));
-
-              await github.request("PATCH /repos/{owner}/{repo}/issues/{issue_number}", {
-                ...coords,
-                labels: nextLabels,
-              });
-
-              labels = nextLabels.map((name) => ({ name }));
+              return null;
             }
 
             async function loadProject() {
@@ -183,8 +132,7 @@ jobs:
               return { fields, items, projectId, title };
             }
 
-            await ensureDefaultJimuLabel();
-            const desiredStatus = issueStatusFromLabels(issueState, labels);
+            const desiredStatus = issueStatusFromEvent(issueAction, issueState);
             const member = repoName.startsWith("jimu-") ? repoName.slice(5) : repoName;
 
             const project = await loadProject();
@@ -200,11 +148,9 @@ jobs:
               return;
             }
 
-            const statusOption = statusField.options.find((option) => option.name === desiredStatus);
             const linkedOption = taskTypeField.options.find((option) => option.name === "linked");
-
-            if (!statusOption || !linkedOption) {
-              core.setFailed("Required project options are missing.");
+            if (!linkedOption) {
+              core.setFailed("Task Type option 'linked' is missing.");
               return;
             }
 
@@ -216,6 +162,14 @@ jobs:
             });
 
             if (!item) {
+              if (issueAction === "edited") {
+                core.summary
+                  .addHeading("Jimu issue sync skipped")
+                  .addRaw("Edited issue is not currently attached to the project.\n")
+                  .write();
+                return;
+              }
+
               const addResult = await github.graphql(
                 `
                   mutation($projectId: ID!, $contentId: ID!) {
@@ -288,7 +242,15 @@ jobs:
               );
             }
 
-            await updateSingleSelectField(statusField.id, statusOption.id);
+            if (desiredStatus) {
+              const statusOption = statusField.options.find((option) => option.name === desiredStatus);
+              if (!statusOption) {
+                core.setFailed(`Status option '${desiredStatus}' is missing.`);
+                return;
+              }
+              await updateSingleSelectField(statusField.id, statusOption.id);
+            }
+
             await updateSingleSelectField(taskTypeField.id, linkedOption.id);
             await updateTextField(issueUrlField.id, issueUrl);
             await updateTextField(memberField.id, member);
@@ -298,7 +260,7 @@ jobs:
               .addTable([
                 [{ data: "Project", header: true }, project.title],
                 [{ data: "Issue URL", header: true }, issueUrl],
-                [{ data: "Status", header: true }, desiredStatus],
+                [{ data: "Status", header: true }, desiredStatus || "(unchanged)"],
                 [{ data: "Task Type", header: true }, "linked"],
                 [{ data: "Member", header: true }, member],
               ])
